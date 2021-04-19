@@ -1,0 +1,532 @@
+{
+	"AWSTemplateFormatVersion": "2010-09-09",
+	"Description": "Create an SSM document to update AD site and create/update DNS zone, and a state manager association to run the document on an EC2 management instance. See 'Improve hybrid Microsoft AD operational stability with AWS Systems Manager' AWS blog for details.",
+	"Metadata": {
+        "RevisionDate": "12-Apr-2021"
+    },
+	"Parameters": {
+		"SiteNames": {
+			"Description": "List of comma separated site Names, NO SPACES. For example - 'SiteName1,SiteName2', the sequence should match the sequence of the Trusted Domains below. The first sitename will be used for the AD site name on AWS side and for pulling DCs for the respective trusted domain, all subsequent site names will only be used to pull DCs for the respective trusted domain",
+			"Type": "String",
+			"AllowedPattern": "^[a-zA-Z0-9\\-\\,]*"
+		},
+		"TrustedDomains": {
+			"Description": "List of on-premise trusted domains comma separated, NO SPACES. For example: 'on-prem1.com,on-prem2.com'",
+			"Type": "String",
+			"AllowedPattern": "^[a-zA-Z0-9\\-\\,\\.]*"
+		},
+		"ManagementEC2Name": {
+			"Description": "The value of the ‘Name’ tag/key pair of the management EC2 instance created as a prerequisite",
+			"Type": "String"
+		},
+		"ExecutionFrequency": {
+			"Description": "Cron expression for the frequency of the SSM Automation execution. Default is - 'cron(0 50 18 ? * * *)' - daily at 18:50 UTC",
+			"Default": "cron(0 50 18 ? * * *)",
+			"Type": "String"
+		}
+	},
+	"Resources": {
+		"AWSAdDnsSSMDocument": {
+			"Type": "AWS::SSM::Document",
+			"Properties": {
+				"DocumentType": "Automation",
+				"TargetType": "/AWS::EC2::Instance",
+				"Name": "AWSAdDnsSSMDocument",
+				"Content": {
+					"schemaVersion": "0.3",
+					"description": "AD Site and DNS zone update document",
+					"assumeRole": "{{AutomationAssumeRole}}",
+					"parameters": {
+						"InstanceId": {
+							"description": "ID of the Instance.",
+							"type": "String",
+							"allowedPattern": "^i-[a-z0-9]{8,17}$|^ami-[a-z0-9]{8,17}"
+						},
+						"SiteNames": {
+							"type": "String",
+							"description": "List of comma separated site Names, for example - 'AWS,Site1', the sequence should match the sequence of the Trusted Domains below. The first sitename will be used for AWS site name and for pulling DCs for the respective trusted domain, all subsequent site names will only be used to pull DCs for the respective trusted domain",
+							"allowedPattern": "^[a-zA-Z0-9\\-\\,]*"
+						},
+						"TrustedDomains": {
+							"type": "String",
+							"description": "List of on-premise trusted domains comma separated, for example: 'on-prem.local,tech.local'",
+							"allowedPattern": "^[a-zA-Z0-9\\-\\,\\.]*"
+						},
+						"AutomationAssumeRole": {
+							"default": "",
+							"description": "The ARN of the role that allows Automation to perform the actions on your behalf.",
+							"type": "String",
+							"allowedPattern": "^arn:aws:iam::\\d{12}:role/.+"
+						}
+					},
+					"mainSteps": [
+						{
+							"name": "AWSRunDnsZoneUpdate",
+							"action": "aws:runCommand",
+							"inputs": {
+								"DocumentName": "AWS-RunPowerShellScript",
+								"InstanceIds": [
+									"{{InstanceId}}"
+								],
+								"CloudWatchOutputConfig": {
+									"CloudWatchOutputEnabled": "true"
+								},
+								"Parameters": {
+									"commands": [
+										"###### ###### ###### ###### ###### ###### ###### ###### ###### ###### ###### #",
+										"# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.         #",
+										"#                                                                            #",
+										"# Permission is hereby granted, free of charge, to any person obtaining a    #",
+										"# copy of this software and associated documentation files (the 'Software'), #",
+										"# to deal in the Software without restriction, including without limitation  #",
+										"# the rights to use, copy, modify, merge, publish, distribute, sublicense,   #",
+										"# and/or sell copies of the Software, and to permit persons to whom the      #",
+										"# Software is furnished to do so.                                            #",
+										"#                                                                            #",
+										"# THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND, EXPRESS OR #",
+										"# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,   #",
+										"# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL    #",
+										"# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER #",
+										"# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING    #",
+										"# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER        #",
+										"# DEALINGS IN THE SOFTWARE.                                                  #",
+										"###### ###### ###### ###### ###### ###### ###### ###### ###### ###### ###### #",
+										"##############################################################################",
+										"#Variables",
+										"#New site names, the sequence should match the sequence of the Trusted Domains below",
+										"#The first sitename will be used for AWS site name and for pulling DCs for the respective trusted domain",
+										"#all subsequent site names will only be used to pull DCs for the respective trusted domain",
+										"$global:SiteNames = '{{SiteNames}}' -split ','",
+										"#TrustedDomain - List of on-prem trusted domains comma separated, for example: 'on-prem.local,tech.local'",
+										"#the sequence should match the sequence of the site names above",
+										"$global:TrustedDomains = '{{TrustedDomains}}' -split ','",
+										"$global:PDC = (Get-ADDomainController -Filter * | where OperationMasterRoles -like '*PDC*').Hostname",
+										"$global:OutputMessage = ''",
+										"#class",
+										"#DNS SRV records",
+										"class DNS {",
+										"    [string]$srvNameDC",
+										"    [string]$srvNameGC",
+										"    [string]$zoneNameDC",
+										"    [string]$zoneNameGC",
+										"    $onpremsrvrecordsdc = [System.Collections.ArrayList]::new()",
+										"    $onpremsrvrecordsgc = [System.Collections.ArrayList]::new()",
+										"}",
+										"#---------------------------------------------------------------#",
+										"#function                                                       #",
+										"#verify if running as Admin                                     #",
+										"#---------------------------------------------------------------#",
+										"function is-admin {",
+										"    (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] \"Administrator\"))",
+										"}",
+										"#---------------------------------------------------------------#",
+										"#function                                                       #",
+										"#rename AD site                                                 #",
+										"#---------------------------------------------------------------#",
+										"function rename-adsite {",
+										"#parameters",
+										"#End parameters",
+										"    if(-NOT ((Get-ADReplicationSite).Name.Contains($global:SiteNames[0])))",
+										"        {",
+										"        $global:OutputMessage += ,' Rename AD Site '+(Get-ADReplicationSite).Name+\" to \"+$global:SiteNames[0]+\".\"",
+										"        Get-ADObject -SearchBase (Get-ADRootDSE).ConfigurationNamingContext -filter 'ObjectClass -eq \"site\"' | Rename-ADObject -NewName $global:SiteNames[0]",
+										"        }",
+										"    else",
+										"        {",
+										"        $global:OutputMessage += ,' AD site already named: '+(Get-ADReplicationSite).Name+''",
+										"        }",
+										"}",
+										"#---------------------------------------------------------------#",
+										"#function                                                       #",
+										"#Add custom Application event log source 'AWSADSiteUpdate'      #",
+										"#---------------------------------------------------------------#",
+										"function add-eventsource {",
+										"#parameters",
+										"#End parameters",
+										"    if(-NOT (Get-ChildItem HKLM:\\SYSTEM\\CurrentControlSet\\Services\\EventLog\\Application).pschildname.Contains(\"AWSADSiteUpdate\"))",
+										"        {",
+										"        $global:OutputMessage += ,' Adding AWSADSiteUpdate to Application log as a source'",
+										"        New-EventLog -LogName Application -Source \"AWSADSiteUpdate\"",
+										"        }",
+										"    else",
+										"        {",
+										"        $global:OutputMessage += ,' AWSADSiteUpdate source already exists in the Application log. Skipping the addition step'",
+										"        }",
+										"}",
+										"#---------------------------------------------------------------#",
+										"#function                                                       #",
+										"#resolve SRV records                                            #",
+										"#---------------------------------------------------------------#",
+										"function resolve-srvrecords {",
+										"#parameters",
+										"Param",
+										"    (",
+										"        [Parameter(Mandatory=$true, Position=1)]",
+										"        [string] $srvrecordname",
+										"    )",
+										"#End parameters",
+										"",
+										"    $onpremsrvrecordlist = @()",
+										"    #Resolve current SRV records and construct array with the records",
+										"        try",
+										"            {",
+										"            $dnsresult = Resolve-DnsName -Name $srvrecordname -Type SRV -ErrorAction Stop",
+										"            foreach($srvrecord in $dnsresult)",
+										"                {",
+										"                if ($srvrecord.name -like '_ldap*')",
+										"                    {",
+										"                    $onpremsrvrecordlist += ,$srvrecord.NameTarget",
+										"                    }",
+										"                }",
+										"            }",
+										"        catch",
+										"            {",
+										"            $global:OutputMessage += ,' On-prem SRV record resolution failed. Stop script execution. Error: '+$Error[0].Exception.Message",
+										"            }",
+										"    return $onpremsrvrecordlist",
+										"}",
+										"#---------------------------------------------------------------#",
+										"#function                                                       #",
+										"#update existing records                                        #",
+										"#---------------------------------------------------------------#",
+										"function update-existingzone {",
+										"#parameters",
+										"Param",
+										"    (",
+										"        [Parameter(Mandatory=$true, Position=0)]",
+										"        [string[]]$onpremsrvrecords,",
+										"        [Parameter(Mandatory=$true, Position=1)]",
+										"        [string] $DNSzoneName,",
+										"        [Parameter(Mandatory=$true, Position=2)]",
+										"        [string] $ZoneType",
+										"    )",
+										"#End parameters",
+										"    $update = $false",
+										"    #construct array of SRV records in AWS",
+										"                    $awssrvrecords = @()",
+										"                    try",
+										"                        {",
+										"                        $dnsresult = Resolve-DnsName -Name ('_ldap.'+$DNSZoneName) -Type SRV | where-object {(($_.Name -Like '*ldap*'))}",
+										"                        #remove obsolete records in AWS zone if any",
+										"                        foreach($srvrecord in $dnsresult)",
+										"                            {",
+										"                            if (-Not $onpremsrvrecords.Contains($srvrecord.NameTarget))",
+										"                                {",
+										"                                $update = $true",
+										"                                $global:OutputMessage += ,' Delete obsolete SRV Record: '+$srvrecord.NameTarget",
+										"                                #Update LDAP for global DC and GC list",
+										"                                Get-DnsServerResourceRecord -Name '_ldap' -ZoneName $DNSzoneName -ComputerName $global:PDC -RRType \"Srv\" | where {$_.RecordData.DomainName.ToString() -match $srvrecord.NameTarget} | Remove-DnsServerResourceRecord -ZoneName $DNSzoneName -ComputerName $global:PDC -Force",
+										"                                #Only for global DC list need to update Krb records",
+										"                                if($ZoneType -eq 'dc')",
+										"                                    {",
+										"                                    Get-DnsServerResourceRecord -Name '_kerberos' -ZoneName $DNSzoneName -ComputerName $global:PDC -RRType \"Srv\" | where {$_.RecordData.DomainName.ToString() -match $srvrecord.NameTarget} | Remove-DnsServerResourceRecord -ZoneName $DNSzoneName -ComputerName $global:PDC -Force",
+										"                                    }",
+										"                                }",
+										"                            else",
+										"                                {",
+										"                                $awssrvrecords += ,$srvrecord.NameTarget",
+										"                                }",
+										"                            }#foreach srvrecord",
+										"                        #add new records to AWS zone if any",
+										"                        foreach($srvrecordname in $onpremsrvrecords)",
+										"                            {",
+										"                            if(-Not $awssrvrecords.Contains($srvrecordname))",
+										"                                {",
+										"                                $update = $true",
+										"                                $global:OutputMessage += ,' Add new SRV Record: '+$srvrecordname",
+										"                                #Update LDAP for global DC and GC list",
+										"                                Add-DnsServerResourceRecord -Name \"_ldap\" -ZoneName $DNSzoneName -DomainName $srvrecordname -ComputerName $global:PDC -Srv -Priority 0 -Weight 100 -Port 389",
+										"                                #Only for global DC list need to update Krb records",
+										"                                if($ZoneType -eq 'dc')",
+										"                                    {",
+										"                                    Add-DnsServerResourceRecord -Name \"_kerberos\" -ZoneName $DNSzoneName -DomainName $srvrecordname -ComputerName $global:PDC -Srv -Priority 0 -Weight 100 -Port 88",
+										"                                    }",
+										"                                }",
+										"                            }#foreach srvrecord                    ",
+										"                        }#try",
+										"                    catch",
+										"                        {",
+										"                        $global:OutputMessage += ,' Error: ',$Error[0].Exception.Message,'Continue script execution'",
+										"                        }",
+										"    return $update",
+										"}",
+										"#---------------------------------------------------------------#",
+										"#function                                                       #",
+										"#create new zone and records                                    #",
+										"#---------------------------------------------------------------#",
+										"function populate-newzone {",
+										"#parameters",
+										"Param",
+										"    (",
+										"        [Parameter(Mandatory=$true, Position=0)]",
+										"        [string[]]$onpremsrvrecords,",
+										"        [Parameter(Mandatory=$true, Position=1)]",
+										"        [string] $DNSzoneName,",
+										"        [Parameter(Mandatory=$true, Position=2)]",
+										"        [string] $ZoneType",
+										"    )",
+										"#End parameters",
+										"    $update = $false",
+										"                    $global:OutputMessage += ,' Zone '+$DNSzoneName+' does not exist, create and add SRV records'",
+										"                    Add-DnsServerPrimaryZone -ComputerName $global:PDC -Name $DNSzoneName -ReplicationScope \"Forest\"",
+										"                    foreach($srvrecordname in $onpremsrvrecords)",
+										"                    {",
+										"                        $update = $true",
+										"                        $global:OutputMessage += ,' Add SRV Record: '+$srvrecordname",
+										"                        #Create LDAP for global DC and GC list",
+										"                        Add-DnsServerResourceRecord -Name \"_ldap\" -ZoneName $DNSzoneName -DomainName $srvrecordname -ComputerName $global:PDC -Srv -Priority 0 -Weight 100 -Port 389",
+										"                        #Only for global DC list need to create Krb records",
+										"                        if($ZoneType -eq 'dc')",
+										"                            {",
+										"                            Add-DnsServerResourceRecord -Name \"_kerberos\" -ZoneName $DNSzoneName -DomainName $srvrecordname -ComputerName $global:PDC -Srv -Priority 0 -Weight 100 -Port 88",
+										"                            }",
+										"                    }",
+										"    return $udpate",
+										"}",
+										"#---------------------------------------------------------------#",
+										"#function                                                       #",
+										"#Check DNS record accuracy                                      #",
+										"#---------------------------------------------------------------#",
+										"function test-dnszone {",
+										"#parameters",
+										"Param",
+										"    (",
+										"        [Parameter(Mandatory=$true, Position=0)]",
+										"        [string[]]$onpremsrvrecords,",
+										"        [Parameter(Mandatory=$true, Position=1)]",
+										"        [string] $DNSzoneName,",
+										"        [Parameter(Mandatory=$true, Position=2)]",
+										"        [string] $ZoneType",
+										"    )",
+										"#End parameters",
+										"    #Test and write to event log",
+										"    try",
+										"        {",
+										"            #retrieve the record value for the LDAP records",
+										"            $dnsresult = Resolve-DnsName -Name ('_ldap.'+$DNSZoneName) -Type SRV | where-object {(($_.Name -NotLike '*ldap*') -AND ($_.QueryType -eq 'A'))} | select Name",
+										"            #write the result to the event log",
+										"            $message = \"TEST RESULTS. On-prem records for site $DNSsrvName : $onpremsrvrecords Result for SRV record lookup for zone $DNSzoneName :\"+$dnsresult.Name",
+										"            Write-EventLog -LogName \"Application\" -Source \"AWSADSiteUpdate\" -EventID 3001 -EntryType Information -Message $message",
+										"        }",
+										"    catch",
+										"        {",
+										"            $message = \"TEST RESULTS. Cannot resolve DNS zone. Error: \"+$Error[0].Exception.Message",
+										"            Write-EventLog -LogName \"Application\" -Source \"AWSADSiteUpdate\" -EventID 3001 -EntryType Error -Message $message",
+										"        }",
+										"}",
+										"#---------------------------------------------------------------#",
+										"#function                                                       #",
+										"#create DNS zone and records                                    #",
+										"#---------------------------------------------------------------#",
+										"function check-dnsandupdate {",
+										"#parameters",
+										"Param",
+										"    (",
+										"        [Parameter(Mandatory=$true, Position=0)]",
+										"        [string[]]$onpremsrvrecords,",
+										"        [Parameter(Mandatory=$true, Position=1)]",
+										"        [string] $DNSzoneName,",
+										"        [Parameter(Mandatory=$true, Position=2)]",
+										"        [string] $ZoneType",
+										"    )",
+										"#End parameters",
+										"    #only proceed if on-prem SRV records exist, oterwise - stop",
+										"    if($onpremsrvrecords.count -ne 0)",
+										"        {",
+										"            #Check if Zone already exists",
+										"            $zoneexists = $false",
+										"            foreach($zone in (Get-DnsServerZone -ComputerName $global:PDC))",
+										"                {",
+										"                $update = $false            ",
+										"                #if exists, update SRV records",
+										"                if($Zone.ZoneName -eq $DNSzoneName)",
+										"                    {",
+										"                        $global:OutputMessage += ,' Zone '+$DNSzoneName+' exists, verifying the accuracy.'",
+										"                        $zoneexists = $true",
+										"",
+										"                        $update = update-existingzone -onpremsrvrecords $onpremsrvrecords -DNSzoneName $DNSzoneName -Zonetype $ZoneType",
+										"                    ",
+										"                    }#if zone = $DNSzoneName",
+										"                }#foreach zone in AWS",
+										"                #if zone does not exist - create and update",
+										"                if(-Not $zoneexists)",
+										"                    {",
+										"                        $update = populate-newzone -onpremsrvrecords $onpremsrvrecords -DNSzoneName $DNSzoneName -Zonetype $ZoneType",
+										"",
+										"                    }",
+										"                if(-NOT $update)",
+										"                    {",
+										"                    $global:OutputMessage += ,' No updates required, zone records are accurate'",
+										"                    }",
+										"                #Output to Event Log per on-prem Zone",
+										"                Write-EventLog -LogName \"Application\" -Source \"AWSADSiteUpdate\" -EventID 3000 -EntryType Information -Message $global:OutputMessage",
+										"                #Console Output",
+										"                Write-Output $global:OutputMessage",
+										"",
+										"                test-dnszone -onpremsrvrecords $onpremsrvrecords -DNSzoneName $DNSzoneName -Zonetype $ZoneType",
+										"",
+										"        }#if on-prem SRV records exist",
+										"    else",
+										"        {",
+										"            #Write Output to Application log. Error",
+										"            $global:OutputMessage += ,\" No on-prem SRV records found, stop script execution for this domain\"",
+										"            Write-EventLog -LogName \"Application\" -Source \"AWSADSiteUpdate\" -EventID 3002 -EntryType Error -Message $global:OutputMessage",
+										"        }",
+										"}",
+										"#---------------------------------------------------------------#",
+										"#function                                                       #",
+										"#Add/Update DNS zone per trusted domain                         #",
+										"#---------------------------------------------------------------#",
+										"function update-dnszone {",
+										"#parameters",
+										"#End parameters",
+										"    $DNS = [DNS]::new()",
+										"    for($i = 0; $i -lt $global:TrustedDomains.Length; $i++)",
+										"        {    ",
+										"        #construct SRV record and future zone templates",
+										"        $DNS.srvNameDC = '_ldap._tcp.'+$global:SiteNames[$i]+'._sites.dc._msdcs.'+$global:TrustedDomains[$i]",
+										"        $DNS.srvNameGC = '_ldap._tcp.'+$global:SiteNames[$i]+'._sites.gc._msdcs.'+$global:TrustedDomains[$i]",
+										"        $DNS.zoneNameDC = '_tcp.dc._msdcs.'+$global:TrustedDomains[$i]",
+										"        $DNS.zoneNameGC = '_tcp.gc._msdcs.'+$global:TrustedDomains[$i]",
+										"        $global:OutputMessage = ''",
+										"",
+										"        #Resolve current SRV records and construct array with the records",
+										"        $DNS.onpremsrvrecordsdc = resolve-srvrecords -srvrecordname $DNS.srvNameDC",
+										"        $DNS.onpremsrvrecordsgc = resolve-srvrecords -srvrecordname $DNS.srvNameGC",
+										"",
+										"        #Check and update DNS for DC",
+										"        check-dnsandupdate -onpremsrvrecords $DNS.onpremsrvrecordsdc -DNSzoneName $DNS.zoneNameDC -ZoneType 'dc'",
+										"        #Check and update DNS for GC",
+										"        $global:OutputMessage = ''",
+										"        check-dnsandupdate -onpremsrvrecords $DNS.onpremsrvrecordsgc -DNSzoneName $DNS.zoneNameGC -ZoneType 'gc'",
+										"        ",
+										"        }#foreach TrustedDomainName",
+										"}",
+										"#---------------------------------------------------------------#",
+										"#MAIN                                                           #",
+										"#Add a random delay of up to 30 seconds to stagger the script   #   ",
+										"#execution among multiple EC2 instances to avoid conflicts      #",
+										"#Otherwise there will be conflict if executed simultaneously    #",
+										"#---------------------------------------------------------------#",
+										"Start-Sleep -Seconds (Get-Random -Minimum 1 -Maximum 30)",
+										"",
+										"#verify if running as Admin",
+										"if (-NOT(is-admin))",
+										"    {",
+										"    Echo \"This script needs to be run As Admin. Continuing, but event log reporting won't be working\"  ",
+										"    }",
+										"",
+										"#Rename site. Works with one site one in MAD",
+										"rename-adsite",
+										"",
+										"#Add custom Application event log source 'AWSADSiteUpdate'",
+										"add-eventsource",
+										"",
+										"#Write Output to App log",
+										"Write-EventLog -LogName \"Application\" -Source \"AWSADSiteUpdate\" -EventID 3000 -EntryType Information -Message $global:OutputMessage",
+										"#Console Output",
+										"Write-Output $global:OutputMessage",
+										"",
+										"update-dnszone"
+									]
+								}
+							}
+						}
+					]
+				}
+			}
+		},
+		"AWSSSMAdDnsAutomationExecutionRole": {
+			"Type": "AWS::IAM::Role",
+			"Properties": {
+				"RoleName": "AWSSSMAdDnsAutomationExecutionRole",
+				"AssumeRolePolicyDocument": {
+					"Version": "2012-10-17",
+					"Statement": [
+						{
+							"Effect": "Allow",
+							"Principal": {
+								"Service": [
+									"ssm.amazonaws.com"
+								]
+							},
+							"Action": [
+								"sts:AssumeRole"
+							]
+						}
+					]
+				},
+				"Path": "/",
+				"Policies": [
+					{
+						"PolicyName": "AWSSSMAdDnsAutomationPolicy",
+						"PolicyDocument": {
+							"Version": "2012-10-17",
+							"Statement": [
+								{
+									"Effect": "Allow",
+									"Action": [
+										"ssm:StartAssociationsOnce",
+										"ssm:CreateAssociation",
+										"ssm:CreateAssociationBatch",
+										"ssm:UpdateAssociation"
+									],
+									"Resource": "*"
+								}
+							]
+						}
+					}
+				],
+				"ManagedPolicyArns": [
+					"arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole"
+				]
+			}
+		},
+		"AWSADSiteDNSzoneSSMAssociation": {
+			"DependsOn": [
+				"AWSSSMAdDnsAutomationExecutionRole"
+			],
+			"Type": "AWS::SSM::Association",
+			"Properties": {
+				"AssociationName": "AWSADSiteDNSzoneAssociation",
+				"Name": {
+					"Ref": "AWSAdDnsSSMDocument"
+				},
+				"ScheduleExpression": {
+					"Ref": "ExecutionFrequency"
+				},
+				"AutomationTargetParameterName": "InstanceId",
+				"Targets": [
+					{
+						"Key": "tag:Name",
+						"Values": [
+							{
+								"Ref": "ManagementEC2Name"
+							}
+						]
+					}
+				],
+				"Parameters": {
+					"AutomationAssumeRole": [
+						{
+							"Fn::GetAtt": [
+								"AWSSSMAdDnsAutomationExecutionRole",
+								"Arn"
+							]
+						}
+					],
+					"SiteNames": [
+						{
+							"Ref": "SiteNames"
+						}
+					],
+					"TrustedDomains": [
+						{
+							"Ref": "TrustedDomains"
+						}
+					]
+				}
+			}
+		}
+	}
+}

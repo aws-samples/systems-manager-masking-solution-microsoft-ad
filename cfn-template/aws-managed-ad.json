@@ -1,0 +1,57 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09", 
+    "Description": "Managed Active Directory",
+    "Metadata": {
+        "RevisionDate": "12-Apr-2021"
+    }, 
+    "Parameters": {
+        "DomainName": {
+            "Description"           : "The Managed AD Domain Name, ex: corpdomain.corp",
+            "Type"                  : "String"
+        },
+        "ShortName": {
+            "Description"           : "The NetBIOS name for your domain, such as corpdomain (Max length is 15 characters.)",
+            "Type"                  : "String",
+            "MaxLength"             : "15"
+        },
+        "DomainAdminPassword"  : {
+            "Description"         : "Default Password for the Managed AD Admin Account.",
+            "Type"                : "String",
+            "MinLength"           : "8",
+            "MaxLength"           : "32",
+            "NoEcho"              : "True"
+        },
+        "VpcId": {
+            "Description"           : "VPC ID where the Microsoft AD directory servers will be created, example: <vpcId>",
+            "Type"                  : "String",
+            "AllowedPattern"        : "^vpc-[a-z0-9]{8}$|^vpc-[a-z0-9]{17}$"
+        },
+        "SubnetID1": {
+            "Description"           : "First subnet ID where a Microsoft AD directory server will be created",
+            "Type"                  : "String",
+            "AllowedPattern"        : "^subnet-[a-z0-9]{17}$|^subnet-[a-z0-9]{8}$"
+        },
+        "SubnetID2": {
+            "Description"           : "Second subnet ID where a Microsoft AD directory server will be created. Has to be in a different AZ from SubnetID1.",
+            "Type"                  : "String",
+            "AllowedPattern"        : "^subnet-[a-z0-9]{17}$|^subnet-[a-z0-9]{8}$"
+        }
+    }, 
+    "Resources": {
+        "ManagedAD" : {
+            "Type" : "AWS::DirectoryService::MicrosoftAD",
+            "Properties" : {
+                "CreateAlias" : "False",
+                "EnableSso" : "False",
+                "Name" : {"Ref": "DomainName"},
+                "Password" : {"Ref": "DomainAdminPassword"},
+                "ShortName" : {"Ref": "ShortName"},
+                "VpcSettings" : {
+                    "SubnetIds" :  [ { "Ref" : "SubnetID1" }, { "Ref" : "SubnetID2" } ],
+                    "VpcId" : { "Ref" : "VpcId" }
+                }
+            }
+        }
+
+    }
+}
